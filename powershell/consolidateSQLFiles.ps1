@@ -1,9 +1,11 @@
 Set-PSDebug -Trace 0;
 
 $fileExtFilter = "*.sql"
+$backupFileExt = "*.bak"
 $sourceSQLFileLocation = "C:\wamp64\www\movies\antexport - copy\"
 $destinationSQLFileLocation  = "C:\wamp64\www\movies\antexport\"
 $destinationSQLFIleName = "movies.sql"
+$backupFileInfo = $destinationSQLFileLocation + $backupFileExt
 $finalSQLFilePathAndName = $destinationSQLFileLocation + $destinationSQLFIleName
 
 if (Test-Path "$sourceSQLFileLocation") 
@@ -25,16 +27,19 @@ if (Test-Path "$sourceSQLFileLocation")
 if (Test-Path $finalSQLFilePathAndName) 
 {
   Remove-Item $finalSQLFilePathAndName -Force
-    Write-Host $finalSQLFilePathAndName " - File deleted."
+  Write-Host $finalSQLFilePathAndName " - File deleted."
+  Remove-Item $backupFileInfo -Force
+  Write-Host $backupFileInfo " - File deleted."
 } else {
     Write-Host $finalSQLFilePathAndName " - File does not exist."
+	Write-Host $backupFileInfo " - File does not exist."
 }
 
 Get-ChildItem $sourceSQLFileLocation -Filter *.sql | Sort-Object { [regex]::Replace($_.Name, '\d+', { $args[0].Value.PadLeft(20) }) } | % {
     $file = $_.Name
     " " | Out-File -Append $finalSQLFilePathAndName
-    "-----------------------------------" | Out-File -Append $finalSQLFilePathAndName
-    "--${file}:" | Out-File -Append $finalSQLFilePathAndName
+    "--" | Out-File -Append $finalSQLFilePathAndName
+    "-- ${file}:" | Out-File -Append $finalSQLFilePathAndName
            " " | Out-File -Append $finalSQLFilePathAndName
     Get-Content $_.FullName | % {
         "$_" | Out-File -Append $finalSQLFilePathAndName
