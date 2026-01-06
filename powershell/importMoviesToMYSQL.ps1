@@ -1,8 +1,8 @@
-# ============================================================
-# REQUIREMENTS
-# ============================================================
+# =====================================================
+# PowerShell Version Check
+# =====================================================
 if ($PSVersionTable.PSVersion.Major -lt 7) {
-    Write-Host "❌ PowerShell 7+ required"
+    Write-Host "This script requires PowerShell 7 or higher." -ForegroundColor Red
     exit
 }
 
@@ -12,240 +12,278 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 chcp 65001 | Out-Null
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
-# ============================================================
-# CONFIG
-# ============================================================
-$mysqlExe  = "C:\wamp64-3.3.7\bin\mysql\mysql9.1.0\bin\mysql.exe"
-$sqlFolder = "C:\wamp64-3.3.7\www\movies\antexport - copy"
-$logFile   = "D:\entertainment\collecting\scripts\powershell\duplicates.log"
+# =====================================================
+# Configuration
+# =====================================================
+$SourceFolder = "C:\wamp64-3.3.7\www\movies\antexport - copy"
 
-$mysqlHost = "localhost"
-$mysqlUser = "root"
-$mysqlDB   = "movies"
+$MySqlExe  = "C:\wamp64-3.3.7\bin\mysql\mysql9.1.0\bin\mysql.exe"
+$MySqlHost = "localhost"
+$MySqlUser = "root"
+$MySqlDB   = "movies"
 
-$batchSize = 25        # safe for huge rows
-$throttle  = 4
+$LogFile       = Join-Path $SourceFolder "import_log.txt"
+$DuplicateFile = Join-Path $SourceFolder "duplicates_log.txt"
 
-if (-not (Test-Path $logFile)) {
-    New-Item -ItemType File -Path $logFile -Force | Out-Null
-} else {
-    Clear-Content $logFile
+$DryRun = $true           # Set to $true to parse without inserting
+$UpsertDuplicates = $true # If true, replace duplicate records
+
+# =====================================================
+# Helper Functions
+# =====================================================
+function Get-ElapsedSeconds([datetime]$startTime) {
+    return ((Get-Date) - $startTime).TotalSeconds
 }
 
-# ============================================================
-# SQL FILES
-# ============================================================
-$sqlFiles = Get-ChildItem $sqlFolder -File |
-    Where-Object { $_.Name -match '^movies_.*\.sql$' -and $_.Name -ne 'movies_00_0000.sql' } |
+function NormalizeLine($line) {
+    return $line.Normalize([Text.NormalizationForm]::FormC)
+}
+
+function Get-RecordHash($line) {
+    if ($line -match "VALUES\s*\((.*)\);$") {
+        $valuesRaw = $matches[1]
+        $pattern = ",(?=(?:[^']*'[^']*')*[^']*$)"
+        $values = [regex]::Split($valuesRaw, $pattern)
+
+        # Column indexes (0-based)
+        $formattedTitle = NormalizeLine($values[13].Trim("'"))
+        $director       = NormalizeLine($values[14].Trim("'"))
+        $year           = $values[21].Trim("'")
+        $url            = NormalizeLine($values[25].Trim("'"))
+        $filepath       = NormalizeLine($values[28].Trim("'"))
+
+        $hashString = "$formattedTitle|$year|$director|$filepath|$url"
+
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($hashString)
+        $hashBytes = $sha.ComputeHash($bytes)
+        $hash = [BitConverter]::ToString($hashBytes) -replace '-', ''
+
+        return @{
+            Hash = $hash
+            FormattedTitle = $formattedTitle
+            Year = $year
+            Director = $director
+            FilePath = $filepath
+            URL = $url
+        }
+    }
+    return $null
+}
+
+# =====================================================
+# Ensure Database Exists with utf8mb4
+# =====================================================
+if (-not $DryRun) {
+    & $MySqlExe -h $MySqlHost -u $MySqlUser --execute "CREATE DATABASE IF NOT EXISTS $MySqlDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+}
+
+# =====================================================
+# Locate SQL files
+# =====================================================
+$sqlFiles = Get-ChildItem -Path $SourceFolder -Filter "movies_*.sql" |
+    Where-Object { $_.Name -like 'movies_*_*-*.sql' -and $_.Name -ne 'movies_00_0000.sql' } |
     Sort-Object Name
 
-Write-Host "✔ Files to import: $($sqlFiles.Count)"
-
-# ============================================================
-# DROP & RECREATE TABLE
-# ============================================================
-@"
-DROP TABLE IF EXISTS movies;
-CREATE TABLE movies (
-  NUM INT NOT NULL,
-  CHECKED TEXT,
-  COLORTAG TEXT,
-  MEDIA TEXT,
-  MEDIATYPE TEXT,
-  SOURCE TEXT,
-  DATEADDED DATE,
-  BORROWER TEXT,
-  DATEWATCHED DATE,
-  USERRATING DECIMAL(3,1),
-  RATING DECIMAL(3,1),
-  ORIGINALTITLE TEXT,
-  TRANSLATEDTITLE TEXT,
-  FORMATTEDTITLE TEXT,
-  DIRECTOR TEXT,
-  PRODUCER TEXT,
-  WRITER TEXT,
-  COMPOSER TEXT,
-  ACTORS TEXT,
-  COUNTRY TEXT,
-  YEAR INT,
-  LENGTH INT,
-  CATEGORY TEXT,
-  CERTIFICATION TEXT,
-  URL TEXT,
-  DESCRIPTION TEXT,
-  COMMENTS TEXT,
-  FILEPATH TEXT,
-  VIDEOFORMAT TEXT,
-  VIDEOBITRATE TEXT,
-  AUDIOFORMAT TEXT,
-  AUDIOBITRATE TEXT,
-  RESOLUTION TEXT,
-  FRAMERATE TEXT,
-  LANGUAGES TEXT,
-  SUBTITLES TEXT,
-  FILESIZE BIGINT,
-  DISKS INT,
-  PICTURESTATUS TEXT,
-  NBEXTRAS INT,
-  PICTURENAME TEXT,
-  dupe_hash CHAR(64) GENERATED ALWAYS AS (
-      SHA2(CONCAT_WS('|', FORMATTEDTITLE, YEAR, FILEPATH), 256)
-  ) STORED,
-  PRIMARY KEY (NUM),
-  UNIQUE KEY uq_dupe (dupe_hash),
-  FULLTEXT KEY ft_movies (
-    FORMATTEDTITLE, ORIGINALTITLE, ACTORS, DIRECTOR, DESCRIPTION, COMMENTS
-  )
-) ENGINE=InnoDB CHARSET=utf8mb4;
-"@ | & $mysqlExe --host=$mysqlHost --user=$mysqlUser --database=$mysqlDB --default-character-set=utf8mb4 2>&1 | Out-Null
-
-# ============================================================
-# INSERT COLUMN LIST
-# ============================================================
-$columnsList = @"
-NUM, CHECKED, COLORTAG, MEDIA, MEDIATYPE, SOURCE, DATEADDED, BORROWER, DATEWATCHED,
-USERRATING, RATING, ORIGINALTITLE, TRANSLATEDTITLE, FORMATTEDTITLE, DIRECTOR,
-PRODUCER, WRITER, COMPOSER, ACTORS, COUNTRY, YEAR, LENGTH, CATEGORY, CERTIFICATION,
-URL, DESCRIPTION, COMMENTS, FILEPATH, VIDEOFORMAT, VIDEOBITRATE, AUDIOFORMAT,
-AUDIOBITRATE, RESOLUTION, FRAMERATE, LANGUAGES, SUBTITLES, FILESIZE, DISKS,
-PICTURESTATUS, NBEXTRAS, PICTURENAME
-"@ -replace "\s+", " "
-
-# ============================================================
-# GLOBAL IMPORT TIMING
-# ============================================================
-$globalStart = Get-Date
-$totalFiles = $sqlFiles.Count
-$summary = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
-
-# ============================================================
-# PARALLEL SAFE ARRAY
-# ============================================================
-$filesArray = $sqlFiles | ForEach-Object { $_ }
-
-# ============================================================
-# TOTAL ROWS ESTIMATE
-# ============================================================
-$totalRows = ($filesArray | ForEach-Object { (Get-Content $_.FullName -Encoding UTF8).Count }) | Measure-Object -Sum
-$totalRows = $totalRows.Sum
-
-# ============================================================
-# IMPORT FILES
-# ============================================================
-$rowsProcessed = 0
-
-for ($i = 0; $i -lt $filesArray.Count; $i++) {
-
-    $file = $filesArray[$i]
-    $lines = Get-Content $file.FullName -Encoding UTF8
-    $total = $lines.Count
-
-    $batch = @()
-    $inserted = 0
-    $row = 0
-    $start = Get-Date
-
-    foreach ($line in $lines) {
-        $row++
-        $rowsProcessed++
-
-        # Per-file ETA
-        $elapsed = (Get-Date) - $start
-        $etaFile = if ($row -gt 0) {
-            [TimeSpan]::FromSeconds((($total - $row) * ($elapsed.TotalSeconds / $row)))
-        }
-
-        # Global ETA
-        $globalElapsed = (Get-Date) - $globalStart
-        $etaGlobal = if ($rowsProcessed -gt 0) {
-            [TimeSpan]::FromSeconds((($totalRows - $rowsProcessed) * ($globalElapsed.TotalSeconds / $rowsProcessed)))
-        }
-
-        Write-Progress -Id 1 `
-            -Activity "Importing $($file.Name)" `
-            -Status "$row / $total | ETA $($etaFile.ToString('hh\:mm\:ss'))" `
-            -PercentComplete (($row / $total) * 100)
-
-        Write-Progress -Id 2 `
-            -Activity "Overall Import Progress" `
-            -Status "File $($i+1)/$totalFiles | Global ETA: $($etaGlobal.ToString('hh\:mm\:ss'))" `
-            -PercentComplete ((($rowsProcessed)/$totalRows) * 100)
-
-        if ($line -match "^INSERT INTO movies.*VALUES\s*\((.*)\);$") {
-            $batch += "($($matches[1]))"
-        }
-
-        if ($batch.Count -ge $batchSize) {
-            $tmp = [System.IO.Path]::GetTempFileName() + ".sql"
-
-            @"
-INSERT IGNORE INTO movies ($columnsList)
-VALUES
-$($batch -join ",`n");
-"@ | Set-Content -Path $tmp -Encoding UTF8
-
-            $result = & $mysqlExe `
-                --host=$mysqlHost --user=$mysqlUser `
-                --database=$mysqlDB `
-                --default-character-set=utf8mb4 `
-                --execute="SOURCE $tmp;" 2>&1
-
-            # check duplicates
-            foreach ($lineErr in $result) {
-                if ($lineErr -match 'Duplicate entry') {
-                    Add-Content -Path $logFile -Value "[$($file.Name)] $lineErr"
-                    $rowsProcessed--  # reduce global row count for failed rows
-                }
-            }
-
-            $inserted += $batch.Count
-            Remove-Item $tmp -Force
-            $batch = @()
-        }
-    }
-
-    # insert remaining
-    if ($batch.Count -gt 0) {
-        $tmp = [System.IO.Path]::GetTempFileName() + ".sql"
-
-        @"
-INSERT IGNORE INTO movies ($columnsList)
-VALUES
-$($batch -join ",`n");
-"@ | Set-Content -Path $tmp -Encoding UTF8
-
-        $result = & $mysqlExe `
-            --host=$mysqlHost --user=$mysqlUser `
-            --database=$mysqlDB `
-            --default-character-set=utf8mb4 `
-            --execute="SOURCE $tmp;" 2>&1
-
-        foreach ($lineErr in $result) {
-            if ($lineErr -match 'Duplicate entry') {
-                Add-Content -Path $logFile -Value "[$($file.Name)] $lineErr"
-                $rowsProcessed--
-            }
-        }
-
-        $inserted += $batch.Count
-        Remove-Item $tmp -Force
-    }
-
-    $summary.Add([PSCustomObject]@{
-        File     = $file.Name
-        Inserted = $inserted
-        Failed   = ($total - $inserted)
-    })
+if ($sqlFiles.Count -eq 0) {
+    Write-Host "No matching SQL files found." -ForegroundColor Yellow
+    exit
 }
 
-# ============================================================
-# FINAL SUMMARY
-# ============================================================
-$totalTime = (Get-Date) - $globalStart
+# =====================================================
+# Auto-detect columns from first INSERT line
+# =====================================================
+$firstInsert = Get-Content $sqlFiles[0].FullName -Encoding UTF8 | Where-Object { $_ -match "^INSERT INTO movies" } | Select-Object -First 1
 
-Write-Host "`n================ IMPORT SUMMARY ================"
-$summary | Sort-Object File | Format-Table -AutoSize
-Write-Host "Total inserted: $(($summary | Measure-Object Inserted -Sum).Sum)"
-Write-Host "Elapsed time : $([math]::Round($totalTime.TotalMinutes,2)) minutes"
-Write-Host "Duplicates logged to: $logFile"
-Write-Host "================================================"
+if (-not $firstInsert) {
+    Write-Host "No INSERT statements found in the first SQL file." -ForegroundColor Red
+    exit
+}
+
+# Extract column names
+if ($firstInsert -match "INSERT INTO movies\s*\((.*?)\)\s*VALUES") {
+    $columnsRaw = $matches[1]
+    $columns = $columnsRaw -split ',' | ForEach-Object { $_.Trim() }
+} else {
+    Write-Host "Failed to parse column names." -ForegroundColor Red
+    exit
+}
+
+# Define column types
+$colDefs = @()
+foreach ($col in $columns) {
+    switch ($col) {
+        "NUM" { $colDefs += "$col INT NOT NULL" }
+        "CHECKED" { $colDefs += "$col BOOLEAN" }
+        "COLORTAG" { $colDefs += "$col INT" }
+        "MEDIA" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "MEDIATYPE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "SOURCE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DATEADDED" { $colDefs += "$col DATE" }
+        "BORROWER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DATEWATCHED" { $colDefs += "$col DATE" }
+        "USERRATING" { $colDefs += "$col VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "RATING" { $colDefs += "$col VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "ORIGINALTITLE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "TRANSLATEDTITLE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FORMATTEDTITLE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DIRECTOR" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "PRODUCER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "WRITER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "COMPOSER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "ACTORS" { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "COUNTRY" { $colDefs += "$col VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "YEAR" { $colDefs += "$col INT" }
+        "LENGTH" { $colDefs += "$col INT" }
+        "CATEGORY" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "CERTIFICATION" { $colDefs += "$col VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "URL" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DESCRIPTION" { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "COMMENTS" { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FILEPATH" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "VIDEOFORMAT" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "VIDEOBITRATE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "AUDIOFORMAT" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "AUDIOBITRATE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "RESOLUTION" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FRAMERATE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "LANGUAGES" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "SUBTITLES" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FILESIZE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DISKS" { $colDefs += "$col INT" }
+        "PICTURESTATUS" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "NBEXTRAS" { $colDefs += "$col INT" }
+        "PICTURENAME" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        Default { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+    }
+}
+
+$createTableSQL = @"
+CREATE TABLE IF NOT EXISTS movies (
+    $($colDefs -join ",`n")
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"@
+
+if (-not $DryRun) {
+    & $MySqlExe -h $MySqlHost -u $MySqlUser --default-character-set=utf8mb4 $MySqlDB --execute $createTableSQL
+    Write-Host "Table 'movies' ensured with utf8mb4 charset."
+}
+
+# =====================================================
+# Initialize hash sets
+# =====================================================
+$existingHashes = New-Object System.Collections.Generic.HashSet[string]
+$seenHashes     = New-Object System.Collections.Generic.HashSet[string]
+
+# =====================================================
+# Initialize logs and stats
+# =====================================================
+"==== Import started $(Get-Date) ====" | Out-File $LogFile -Encoding UTF8
+"==== Duplicate detection log $(Get-Date) ====" | Out-File $DuplicateFile -Encoding UTF8
+
+$totalFiles    = $sqlFiles.Count
+$currentFile   = 0
+$totalRecords  = 0
+$duplicates    = 0
+$totalBytes    = ($sqlFiles | Measure-Object Length -Sum).Sum
+$processedBytes = 0
+$globalStart   = Get-Date
+
+# =====================================================
+# Import loop
+# =====================================================
+foreach ($file in $sqlFiles) {
+
+    $currentFile++
+    $fileStart = Get-Date
+
+    Write-Host ""
+    Write-Host "[$currentFile/$totalFiles] Processing $($file.Name)"
+
+    # Temp SQL file with UTF-8 encoding
+    $tempSql = [System.IO.Path]::GetTempFileName()
+    $writer = [System.IO.StreamWriter]::new($tempSql, $false, [System.Text.Encoding]::UTF8)
+    $writer.WriteLine("START TRANSACTION;")
+
+    $fs = [System.IO.File]::OpenRead($file.FullName)
+    $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+
+    $lineNumber = 0
+    while (-not $reader.EndOfStream) {
+        $lineNumber++
+        $line = NormalizeLine($reader.ReadLine())
+
+        if ($line -match "^INSERT INTO movies") {
+            $record = Get-RecordHash $line
+            if ($record -and ($existingHashes.Contains($record.Hash) -or $seenHashes.Contains($record.Hash))) {
+                $duplicates++
+                $logLine = "File: $($file.Name), Line: $lineNumber, FORMATTEDTITLE: '$($record.FormattedTitle)', YEAR: '$($record.Year)', DIRECTOR: '$($record.Director)', URL: '$($record.URL)', FILEPATH: '$($record.FilePath)', Hash: $($record.Hash)"
+                $logLine | Out-File $DuplicateFile -Append -Encoding UTF8
+                continue
+            }
+
+            $seenHashes.Add($record.Hash) | Out-Null
+
+            if ($UpsertDuplicates) {
+                $line = $line -replace '^INSERT INTO movies', 'REPLACE INTO movies'
+            } else {
+                $line = $line -replace '^INSERT INTO movies', 'INSERT IGNORE INTO movies'
+            }
+
+            $writer.WriteLine($line)
+            $totalRecords++
+        } else {
+            $writer.WriteLine($line)
+        }
+
+        $processedBytes += $reader.CurrentEncoding.GetByteCount($line + "`n")
+
+        $overallPct = [Math]::Min(100, ($processedBytes / $totalBytes) * 100)
+        $filePct    = [Math]::Min(100, ($fs.Position / $fs.Length) * 100)
+
+        Write-Progress -Id 1 -Activity "Overall Import Progress" -Status "File $currentFile of $totalFiles" -PercentComplete $overallPct
+        Write-Progress -Id 2 -ParentId 1 -Activity "Importing $($file.Name)" -Status "Processing SQL..." -PercentComplete $filePct
+    }
+
+    $writer.WriteLine("COMMIT;")
+    $reader.Close()
+    $fs.Close()
+    $writer.Close()
+
+    if (-not $DryRun) {
+        Get-Content $tempSql -Encoding UTF8 | & $MySqlExe -h $MySqlHost -u $MySqlUser --default-character-set=utf8mb4 $MySqlDB | Out-Null
+        Start-Sleep -Milliseconds 200
+    }
+
+    Remove-Item $tempSql -Force -ErrorAction SilentlyContinue
+
+    $seconds = Get-ElapsedSeconds $fileStart
+    $rate = if ($seconds -gt 0) { [math]::Round($totalRecords / $seconds, 2) } else { 0 }
+    "$($file.Name) | Speed: $rate rows/sec" | Out-File $LogFile -Append -Encoding UTF8
+}
+
+# =====================================================
+# Completion
+# =====================================================
+Write-Progress -Id 1 -Completed
+Write-Progress -Id 2 -Completed
+
+$elapsed = Get-ElapsedSeconds $globalStart
+
+$summary = @"
+==== Import completed $(Get-Date) ====
+Files processed : $currentFile
+Total records   : $totalRecords
+Duplicates      : $duplicates
+Time taken      : {0:N2} sec
+Dry-run mode    : $DryRun
+UPSERT enabled  : $UpsertDuplicates
+UTF-8 safe      : Yes (preserves accents and other languages)
+PowerShell 7+   : Required
+Hash fields     : FORMATTEDTITLE | YEAR | DIRECTOR | FILEPATH | URL
+Duplicate log  : $DuplicateFile
+====================================
+"@ -f $elapsed
+
+$summary | Out-File $LogFile -Append -Encoding UTF8
+Write-Host $summary -ForegroundColor Green
