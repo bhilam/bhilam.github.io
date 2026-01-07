@@ -6,9 +6,10 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     exit
 }
 
-# =====================================================
+# ============================================================
 # UTF-8 SAFETY
-# =====================================================
+# ============================================================
+chcp 65001 | Out-Null
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 # =====================================================
@@ -24,18 +25,18 @@ $MySqlDB   = "movies"
 $LogFile       = Join-Path $SourceFolder "import_log.txt"
 $DuplicateFile = Join-Path $SourceFolder "duplicates_log.txt"
 
-$DryRun = $true            # Set to $false to actually import
-$UpsertDuplicates = $true  # REPLACE INTO vs INSERT IGNORE
+$DryRun = $false           # Set to $true to parse without inserting
+$UpsertDuplicates = $true # If true, replace duplicate records
 
 # =====================================================
 # Helper Functions
 # =====================================================
 function Get-ElapsedSeconds([datetime]$startTime) {
-    ((Get-Date) - $startTime).TotalSeconds
+    return ((Get-Date) - $startTime).TotalSeconds
 }
 
 function NormalizeLine($line) {
-    $line.Normalize([Text.NormalizationForm]::FormC)
+    return $line.Normalize([Text.NormalizationForm]::FormC)
 }
 
 function Get-RecordHash($line) {
@@ -44,6 +45,7 @@ function Get-RecordHash($line) {
         $pattern = ",(?=(?:[^']*'[^']*')*[^']*$)"
         $values = [regex]::Split($valuesRaw, $pattern)
 
+        # Column indexes (0-based)
         $formattedTitle = NormalizeLine($values[13].Trim("'"))
         $director       = NormalizeLine($values[14].Trim("'"))
         $year           = $values[21].Trim("'")
@@ -54,7 +56,8 @@ function Get-RecordHash($line) {
 
         $sha = [System.Security.Cryptography.SHA256]::Create()
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($hashString)
-        $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', ''
+        $hashBytes = $sha.ComputeHash($bytes)
+        $hash = [BitConverter]::ToString($hashBytes) -replace '-', ''
 
         return @{
             Hash = $hash
@@ -69,13 +72,10 @@ function Get-RecordHash($line) {
 }
 
 # =====================================================
-# Ensure Database Exists (utf8mb4)
+# Ensure Database Exists with utf8mb4
 # =====================================================
 if (-not $DryRun) {
-    & $MySqlExe `
-        -h $MySqlHost `
-        -u $MySqlUser `
-        --execute "CREATE DATABASE IF NOT EXISTS $MySqlDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    & $MySqlExe -h $MySqlHost -u $MySqlUser --execute "CREATE DATABASE IF NOT EXISTS $MySqlDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 }
 
 # =====================================================
@@ -91,54 +91,138 @@ if ($sqlFiles.Count -eq 0) {
 }
 
 # =====================================================
-# Hash Sets
+# Auto-detect columns from first INSERT line
 # =====================================================
-$existingHashes = [System.Collections.Generic.HashSet[string]]::new()
-$seenHashes     = [System.Collections.Generic.HashSet[string]]::new()
+$firstInsert = Get-Content $sqlFiles[0].FullName -Encoding UTF8 | Where-Object { $_ -match "^INSERT INTO movies" } | Select-Object -First 1
+
+if (-not $firstInsert) {
+    Write-Host "No INSERT statements found in the first SQL file." -ForegroundColor Red
+    exit
+}
+
+# Extract column names
+if ($firstInsert -match "INSERT INTO movies\s*\((.*?)\)\s*VALUES") {
+    $columnsRaw = $matches[1]
+    $columns = $columnsRaw -split ',' | ForEach-Object { $_.Trim() }
+} else {
+    Write-Host "Failed to parse column names." -ForegroundColor Red
+    exit
+}
+
+# Define column types
+$colDefs = @()
+foreach ($col in $columns) {
+    switch ($col) {
+        "NUM" { $colDefs += "$col INT NOT NULL" }
+        "CHECKED" { $colDefs += "$col BOOLEAN" }
+        "COLORTAG" { $colDefs += "$col INT" }
+        "MEDIA" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "MEDIATYPE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "SOURCE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DATEADDED" { $colDefs += "$col DATE" }
+        "BORROWER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DATEWATCHED" { $colDefs += "$col DATE" }
+        "USERRATING" { $colDefs += "$col VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "RATING" { $colDefs += "$col VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "ORIGINALTITLE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "TRANSLATEDTITLE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FORMATTEDTITLE" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DIRECTOR" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "PRODUCER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "WRITER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "COMPOSER" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "ACTORS" { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "COUNTRY" { $colDefs += "$col VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "YEAR" { $colDefs += "$col INT" }
+        "LENGTH" { $colDefs += "$col INT" }
+        "CATEGORY" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "CERTIFICATION" { $colDefs += "$col VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "URL" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DESCRIPTION" { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "COMMENTS" { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FILEPATH" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "VIDEOFORMAT" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "VIDEOBITRATE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "AUDIOFORMAT" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "AUDIOBITRATE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "RESOLUTION" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FRAMERATE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "LANGUAGES" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "SUBTITLES" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "FILESIZE" { $colDefs += "$col VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "DISKS" { $colDefs += "$col INT" }
+        "PICTURESTATUS" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        "NBEXTRAS" { $colDefs += "$col INT" }
+        "PICTURENAME" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+        Default { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+    }
+}
+
+$createTableSQL = @"
+CREATE TABLE IF NOT EXISTS movies (
+    $($colDefs -join ",`n")
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"@
+
+if (-not $DryRun) {
+    & $MySqlExe -h $MySqlHost -u $MySqlUser --default-character-set=utf8mb4 $MySqlDB --execute $createTableSQL
+    Write-Host "Table 'movies' ensured with utf8mb4 charset."
+}
 
 # =====================================================
-# Logs
+# Initialize hash sets
+# =====================================================
+$existingHashes = New-Object System.Collections.Generic.HashSet[string]
+$seenHashes     = New-Object System.Collections.Generic.HashSet[string]
+
+# =====================================================
+# Initialize logs and stats
 # =====================================================
 "==== Import started $(Get-Date) ====" | Out-File $LogFile -Encoding UTF8
-"==== Duplicate log $(Get-Date) ====" | Out-File $DuplicateFile -Encoding UTF8
+"==== Duplicate detection log $(Get-Date) ====" | Out-File $DuplicateFile -Encoding UTF8
 
-$totalFiles = $sqlFiles.Count
-$currentFile = 0
-$totalRecords = 0
-$duplicates = 0
-$globalStart = Get-Date
+$totalFiles    = $sqlFiles.Count
+$currentFile   = 0
+$totalRecords  = 0
+$duplicates    = 0
+$totalBytes    = ($sqlFiles | Measure-Object Length -Sum).Sum
+$processedBytes = 0
+$globalStart   = Get-Date
 
 # =====================================================
-# Import Loop (direct piping, UTF-8 safe)
+# Import loop
 # =====================================================
 foreach ($file in $sqlFiles) {
 
     $currentFile++
-    Write-Host "`n[$currentFile/$totalFiles] Processing $($file.Name)"
+    $fileStart = Get-Date
 
-    $linesToSend = @()
-    $linesToSend += "START TRANSACTION;"
-    $linesToSend += "SET NAMES utf8mb4;"
-    $linesToSend += "SET character_set_client = utf8mb4;"
-    $linesToSend += "SET character_set_connection = utf8mb4;"
-    $linesToSend += "SET character_set_results = utf8mb4;"
+    Write-Host ""
+    Write-Host "[$currentFile/$totalFiles] Processing $($file.Name)"
 
-    Get-Content $file.FullName -Encoding UTF8 | ForEach-Object {
-        $line = NormalizeLine($_)
+    # Temp SQL file with UTF-8 encoding
+    $tempSql = [System.IO.Path]::GetTempFileName()
+    $writer = [System.IO.StreamWriter]::new($tempSql, $false, [System.Text.Encoding]::UTF8)
+    $writer.WriteLine("START TRANSACTION;")
+
+    $fs = [System.IO.File]::OpenRead($file.FullName)
+    $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+
+    $lineNumber = 0
+    while (-not $reader.EndOfStream) {
+        $lineNumber++
+        $line = NormalizeLine($reader.ReadLine())
 
         if ($line -match "^INSERT INTO movies") {
             $record = Get-RecordHash $line
-
             if ($record -and ($existingHashes.Contains($record.Hash) -or $seenHashes.Contains($record.Hash))) {
                 $duplicates++
-                "Duplicate: $($record.FormattedTitle) ($($record.Year))" |
-                    Out-File $DuplicateFile -Append -Encoding UTF8
-                return
+                $logLine = "File: $($file.Name), Line: $lineNumber, FORMATTEDTITLE: '$($record.FormattedTitle)', YEAR: '$($record.Year)', DIRECTOR: '$($record.Director)', URL: '$($record.URL)', FILEPATH: '$($record.FilePath)', Hash: $($record.Hash)"
+                $logLine | Out-File $DuplicateFile -Append -Encoding UTF8
+                continue
             }
 
-            if ($record) {
-                $seenHashes.Add($record.Hash) | Out-Null
-            }
+            $seenHashes.Add($record.Hash) | Out-Null
 
             if ($UpsertDuplicates) {
                 $line = $line -replace '^INSERT INTO movies', 'REPLACE INTO movies'
@@ -146,27 +230,48 @@ foreach ($file in $sqlFiles) {
                 $line = $line -replace '^INSERT INTO movies', 'INSERT IGNORE INTO movies'
             }
 
+            $writer.WriteLine($line)
             $totalRecords++
+        } else {
+            $writer.WriteLine($line)
         }
 
-        $linesToSend += $line
+        $processedBytes += $reader.CurrentEncoding.GetByteCount($line + "`n")
+
+        $overallPct = [Math]::Min(100, ($processedBytes / $totalBytes) * 100)
+        $filePct    = [Math]::Min(100, ($fs.Position / $fs.Length) * 100)
+
+        Write-Progress -Id 1 -Activity "Overall Import Progress" -Status "File $currentFile of $totalFiles" -PercentComplete $overallPct
+        Write-Progress -Id 2 -ParentId 1 -Activity "Importing $($file.Name)" -Status "Processing SQL..." -PercentComplete $filePct
     }
 
-    $linesToSend += "COMMIT;"
+    $writer.WriteLine("COMMIT;")
+    $reader.Close()
+    $fs.Close()
+    $writer.Close()
 
-    # Send SQL directly to MySQL
     if (-not $DryRun) {
-        $linesToSend -join "`n" | & $MySqlExe `
-            -h $MySqlHost `
-            -u $MySqlUser `
-            --database=$MySqlDB `
-            --default-character-set=utf8mb4
+        #Get-Content $tempSql -Encoding UTF8 | & $MySqlExe -h $MySqlHost -u $MySqlUser --default-character-set=utf8mb4 $MySqlDB | Out-Null
+        #Start-Sleep -Milliseconds 200
+		
+		# Feed SQL file directly to MySQL client preserving UTF-8
+		$mysqlCmd = "$MySqlExe -h $MySqlHost -u $MySqlUser --default-character-set=utf8mb4 $MySqlDB < `"$tempSql`""
+		cmd.exe /c $mysqlCmd
     }
+
+    Remove-Item $tempSql -Force -ErrorAction SilentlyContinue
+
+    $seconds = Get-ElapsedSeconds $fileStart
+    $rate = if ($seconds -gt 0) { [math]::Round($totalRecords / $seconds, 2) } else { 0 }
+    "$($file.Name) | Speed: $rate rows/sec" | Out-File $LogFile -Append -Encoding UTF8
 }
 
 # =====================================================
 # Completion
 # =====================================================
+Write-Progress -Id 1 -Completed
+Write-Progress -Id 2 -Completed
+
 $elapsed = Get-ElapsedSeconds $globalStart
 
 $summary = @"
@@ -177,7 +282,7 @@ Duplicates      : $duplicates
 Time taken      : {0:N2} sec
 Dry-run mode    : $DryRun
 UPSERT enabled  : $UpsertDuplicates
-UTF-8 safe      : YES (accented & multilingual)
+UTF-8 safe      : Yes (preserves accents and other languages)
 PowerShell 7+   : Required
 Hash fields     : FORMATTEDTITLE | YEAR | DIRECTOR | FILEPATH | URL
 Duplicate log  : $DuplicateFile
