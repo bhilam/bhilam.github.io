@@ -6,9 +6,9 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     exit
 }
 
-# ============================================================
+# =====================================================
 # UTF-8 SAFETY
-# ============================================================
+# =====================================================
 chcp 65001 | Out-Null
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
@@ -25,7 +25,7 @@ $MySqlDB   = "movies"
 $LogFile       = Join-Path $SourceFolder "import_log.txt"
 $DuplicateFile = Join-Path $SourceFolder "duplicates_log.txt"
 
-$DryRun = $false           # Set to $true to parse without inserting
+$DryRun = $true           # Set to $true to parse without inserting
 $UpsertDuplicates = $true # If true, replace duplicate records
 
 # =====================================================
@@ -37,6 +37,11 @@ function Get-ElapsedSeconds([datetime]$startTime) {
 
 function NormalizeLine($line) {
     return $line.Normalize([Text.NormalizationForm]::FormC)
+}
+
+function EscapeForMySql($value) {
+    # Escape backslash and single quotes for MySQL
+    return $value -replace "\\", "\\\\" -replace "'", "''"
 }
 
 function Get-RecordHash($line) {
@@ -70,6 +75,14 @@ function Get-RecordHash($line) {
     }
     return $null
 }
+
+function EscapeInsertLine($line) {
+    return [regex]::Replace($line, "'([^']*)'", {
+        param($matches)
+        "'" + (EscapeForMySql($matches.Groups[1].Value)) + "'"
+    })
+}
+
 
 # =====================================================
 # Ensure Database Exists with utf8mb4
@@ -190,7 +203,7 @@ $processedBytes = 0
 $globalStart   = Get-Date
 
 # =====================================================
-# Import loop
+# Import loop (UTF-8 safe)
 # =====================================================
 foreach ($file in $sqlFiles) {
 
@@ -200,11 +213,12 @@ foreach ($file in $sqlFiles) {
     Write-Host ""
     Write-Host "[$currentFile/$totalFiles] Processing $($file.Name)"
 
-    # Temp SQL file with UTF-8 encoding
+    # Temp SQL file with UTF-8 encoding (no BOM)
     $tempSql = [System.IO.Path]::GetTempFileName()
     $writer = [System.IO.StreamWriter]::new($tempSql, $false, [System.Text.Encoding]::UTF8)
     $writer.WriteLine("START TRANSACTION;")
 
+    # Open original SQL file as UTF-8
     $fs = [System.IO.File]::OpenRead($file.FullName)
     $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
 
@@ -224,11 +238,15 @@ foreach ($file in $sqlFiles) {
 
             $seenHashes.Add($record.Hash) | Out-Null
 
+            # Upsert or ignore duplicates
             if ($UpsertDuplicates) {
                 $line = $line -replace '^INSERT INTO movies', 'REPLACE INTO movies'
             } else {
                 $line = $line -replace '^INSERT INTO movies', 'INSERT IGNORE INTO movies'
             }
+
+            # Escape string literals for MySQL (UTF-8 safe)
+            $line = EscapeInsertLine $line
 
             $writer.WriteLine($line)
             $totalRecords++
@@ -236,8 +254,8 @@ foreach ($file in $sqlFiles) {
             $writer.WriteLine($line)
         }
 
+        # Progress tracking
         $processedBytes += $reader.CurrentEncoding.GetByteCount($line + "`n")
-
         $overallPct = [Math]::Min(100, ($processedBytes / $totalBytes) * 100)
         $filePct    = [Math]::Min(100, ($fs.Position / $fs.Length) * 100)
 
@@ -250,17 +268,15 @@ foreach ($file in $sqlFiles) {
     $fs.Close()
     $writer.Close()
 
+    # Execute the temp SQL file (UTF-8 safe)
     if (-not $DryRun) {
-        #Get-Content $tempSql -Encoding UTF8 | & $MySqlExe -h $MySqlHost -u $MySqlUser --default-character-set=utf8mb4 $MySqlDB | Out-Null
-        #Start-Sleep -Milliseconds 200
-		
-		# Feed SQL file directly to MySQL client preserving UTF-8
-		$mysqlCmd = "$MySqlExe -h $MySqlHost -u $MySqlUser --default-character-set=utf8mb4 $MySqlDB < `"$tempSql`""
-		cmd.exe /c $mysqlCmd
+        & cmd /c "$MySqlExe --default-character-set=utf8mb4 -h $MySqlHost -u $MySqlUser $MySqlDB < `"$tempSql`""
+        Start-Sleep -Milliseconds 200
     }
 
     Remove-Item $tempSql -Force -ErrorAction SilentlyContinue
 
+    # Log speed
     $seconds = Get-ElapsedSeconds $fileStart
     $rate = if ($seconds -gt 0) { [math]::Round($totalRecords / $seconds, 2) } else { 0 }
     "$($file.Name) | Speed: $rate rows/sec" | Out-File $LogFile -Append -Encoding UTF8
@@ -282,7 +298,7 @@ Duplicates      : $duplicates
 Time taken      : {0:N2} sec
 Dry-run mode    : $DryRun
 UPSERT enabled  : $UpsertDuplicates
-UTF-8 safe      : Yes (preserves accents and other languages)
+UTF-8 safe      : Yes (preserves accents, emojis, other languages)
 PowerShell 7+   : Required
 Hash fields     : FORMATTEDTITLE | YEAR | DIRECTOR | FILEPATH | URL
 Duplicate log  : $DuplicateFile
