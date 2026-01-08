@@ -126,7 +126,7 @@ if ($firstInsert -match "INSERT INTO movies\s*\((.*?)\)\s*VALUES") {
 $colDefs = @()
 foreach ($col in $columns) {
     switch ($col) {
-        "NUM" { $colDefs += "$col INT NOT NULL" }
+        "NUMBER" { $colDefs += "$col INT NOT NULL" }
         "CHECKED" { $colDefs += "$col BOOLEAN" }
         "COLORTAG" { $colDefs += "$col INT" }
         "MEDIA" { $colDefs += "$col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
@@ -307,3 +307,4 @@ Duplicate log  : $DuplicateFile
 
 $summary | Out-File $LogFile -Append -Encoding UTF8
 Write-Host $summary -ForegroundColor Green
+
