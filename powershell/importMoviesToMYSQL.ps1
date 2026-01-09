@@ -111,7 +111,10 @@ function ParseInsertLine {
         $v = $vals[$i].Trim()
         if ($v -eq "NULL") { $v = $null }
         elseif ($v.StartsWith("'")) {
-            $v = $v.Substring(1,$v.Length-2).Replace("''","'")
+            #$v = $v.Substring(1,$v.Length-2).Replace("''","'")
+			$v = $v.Substring(1,$v.Length-2)
+			$v = $v.Replace("''","'")
+			$v = $v.Replace("\\","\")   # <-- ADD THIS LINE
         }
         $row[$Columns[$i]] = $v
     }
