@@ -16,7 +16,7 @@ $Config = @{
     DropTable          = $true
     InputEncoding      = [Text.Encoding]::GetEncoding("ISO-8859-1")
     OutputEncoding     = [Text.UTF8Encoding]::new($false)
-    SqlFileFilter      = "movies_*_*-0249.sql"
+    SqlFileFilter      = "movies_*_*-*.sql"
     ExcludeFiles       = @('movies_00_0000.sql')
     BatchSize          = 500
 }
@@ -342,3 +342,4 @@ Excluded files           : $($Config.ExcludeFiles -join ', ')
 
 $summary | Out-File $Config.LogFile -Append -Encoding UTF8
 Write-Host $summary -ForegroundColor Green
+
