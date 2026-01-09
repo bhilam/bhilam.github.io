@@ -1,263 +1,267 @@
 # =====================================================
-# PowerShell Version Check
+# ================= Configuration ====================
+# =====================================================
+$global:committedRecords = 0
+
+$Config = @{
+    SourceFolder       = "C:\wamp64-3.3.7\www\movies\antexport - copy"
+    MySqlExe           = "C:\wamp64-3.3.7\bin\mysql\mysql9.1.0\bin\mysql.exe"
+    MySqlHost          = "localhost"
+    MySqlUser          = "root"
+    MySqlPass          = ""
+    MySqlDB            = "movies"
+    LogFile            = "import_log.txt"
+    DuplicateFile      = "duplicates_log.txt"
+    DryRun             = $false
+    DropTable          = $true
+    InputEncoding      = [Text.Encoding]::GetEncoding("ISO-8859-1")
+    OutputEncoding     = [Text.UTF8Encoding]::new($false)
+    SqlFileFilter      = "movies_*_*-0249.sql"
+    ExcludeFiles       = @('movies_00_0000.sql')
+    BatchSize          = 500
+}
+
+$Config.LogFile       = Join-Path $Config.SourceFolder $Config.LogFile
+$Config.DuplicateFile = Join-Path $Config.SourceFolder $Config.DuplicateFile
+
+# =====================================================
+# ================= PowerShell Check =================
 # =====================================================
 if ($PSVersionTable.PSVersion.Major -lt 7) {
-    Write-Host "This script requires PowerShell 7 or higher." -ForegroundColor Red
+    Write-Host "PowerShell 7+ required." -ForegroundColor Red
     exit
 }
 
-# =====================================================
-# UTF-8 + LATIN1 SAFETY
-# =====================================================
 chcp 65001 | Out-Null
-$Utf8NoBom      = [System.Text.UTF8Encoding]::new($false)
-$Latin1Encoding = [System.Text.Encoding]::GetEncoding("ISO-8859-1")
-$OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Config.OutputEncoding
 
 # =====================================================
-# Configuration
+# ================= Helper Functions =================
 # =====================================================
-$SourceFolder = "C:\wamp64-3.3.7\www\movies\antexport - copy"
-
-$MySqlExe  = "C:\wamp64-3.3.7\bin\mysql\mysql9.1.0\bin\mysql.exe"
-$MySqlHost = "localhost"
-$MySqlUser = "root"
-$MySqlDB   = "movies"
-
-$LogFile       = Join-Path $SourceFolder "import_log.txt"
-$DuplicateFile = Join-Path $SourceFolder "duplicates_log.txt"
-
-$DryRun = $false
-$UpsertDuplicates = $true
-
-# =====================================================
-# Helper Functions
-# =====================================================
-function Get-ElapsedSeconds([datetime]$startTime) {
-    return ((Get-Date) - $startTime).TotalSeconds
-}
-
 function NormalizeLine($line) {
-    return $line.Normalize([Text.NormalizationForm]::FormC)
+    $line.Normalize([Text.NormalizationForm]::FormC)
 }
 
-function EscapeForMySql($value) {
-    #return $value -replace "\\", "\\\\" -replace "'", "''"
-	# Only escape single quotes for MySQL
-    return $value -replace "'", "''"
+function Get-ElapsedSeconds($start) {
+    ((Get-Date) - $start).TotalSeconds
 }
 
-function Get-RecordHash($line) {
-    if ($line -match "VALUES\s*\((.*)\);$") {
-        $valuesRaw = $matches[1]
-        $pattern = ",(?=(?:[^']*'[^']*')*[^']*$)"
-        $values = [regex]::Split($valuesRaw, $pattern)
+function Get-RecordHash($v) {
+    $s = "$($v.FORMATTEDTITLE)|$($v.YEAR)|$($v.DIRECTOR)|$($v.URL)|$($v.FILEPATH)"
+    $sha = [Security.Cryptography.SHA256]::Create()
+    ([BitConverter]::ToString(
+        $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))
+    )) -replace '-', ''
+}
 
-        $formattedTitle = NormalizeLine($values[13].Trim("'"))
-        $director       = NormalizeLine($values[14].Trim("'"))
-        $year           = $values[21].Trim("'")
-        $url            = NormalizeLine($values[25].Trim("'"))
-        $filepath       = NormalizeLine($values[28].Trim("'"))
+function ParseInsertLine {
+    param ($line, $Columns)
 
-        $hashString = "$formattedTitle|$year|$director|$filepath|$url"
+    if ($line -notmatch "^INSERT INTO movies\s*\(.+?\)\s*VALUES\s*\(.+\);$") {
+        return $null
+    }
 
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($hashString)
-        $hashBytes = $sha.ComputeHash($bytes)
-        $hash = [BitConverter]::ToString($hashBytes) -replace '-', ''
+    $vals = [regex]::Split(
+        ($line -replace '^.+?VALUES\s*\(|\);$',''),
+        ",(?=(?:[^']*'[^']*')*[^']*$)"
+    )
 
-        return @{
-            Hash = $hash
-            FormattedTitle = $formattedTitle
-            Year = $year
-            Director = $director
-            FilePath = $filepath
-            URL = $url
+    if ($vals.Count -ne $Columns.Count) { return $null }
+
+    $row = @{ }
+    for ($i=0; $i -lt $Columns.Count; $i++) {
+        $v = $vals[$i].Trim()
+        if ($v -eq "NULL") { $v = $null }
+        elseif ($v.StartsWith("'")) {
+            $v = $v.Substring(1,$v.Length-2).Replace("''","'")
         }
+        $row[$Columns[$i]] = $v
     }
-    return $null
-}
-
-function EscapeInsertLine($line) {
-    return [regex]::Replace($line, "'([^']*)'", {
-        param($matches)
-        "'" + (EscapeForMySql($matches.Groups[1].Value)) + "'"
-    })
+    return $row
 }
 
 # =====================================================
-# Ensure Database Exists (utf8mb4)
+# ================= Locate SQL Files =================
 # =====================================================
-if (-not $DryRun) {
-    & $MySqlExe -h $MySqlHost -u $MySqlUser `
-        --execute "CREATE DATABASE IF NOT EXISTS $MySqlDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-}
+$sqlFiles = Get-ChildItem $Config.SourceFolder -Filter $Config.SqlFileFilter |
+            Where-Object { $Config.ExcludeFiles -notcontains $_.Name } |
+            Sort-Object Name
 
-# =====================================================
-# Locate SQL files
-# =====================================================
-$sqlFiles = Get-ChildItem -Path $SourceFolder -Filter "movies_*.sql" |
-    Where-Object { $_.Name -like 'movies_*_*-*.sql' -and $_.Name -ne 'movies_00_0000.sql' } |
-    Sort-Object Name
-
-if ($sqlFiles.Count -eq 0) {
-    Write-Host "No matching SQL files found." -ForegroundColor Yellow
+if (-not $sqlFiles) {
+    Write-Host "No SQL files found." -ForegroundColor Yellow
     exit
 }
 
 # =====================================================
-# Auto-detect columns
+# ================= Detect Columns ===================
 # =====================================================
-$firstInsert = Get-Content $sqlFiles[0].FullName -Encoding ISO-8859-1 |
-    Where-Object { $_ -match "^INSERT INTO movies" } |
-    Select-Object -First 1
+$firstInsert = Get-Content $sqlFiles[0].FullName -Encoding $Config.InputEncoding |
+               Where-Object { $_ -match "INSERT INTO movies" } |
+               Select-Object -First 1
 
-if (-not $firstInsert) {
-    Write-Host "No INSERT statements found." -ForegroundColor Red
-    exit
-}
-
-if ($firstInsert -match "INSERT INTO movies\s*\((.*?)\)\s*VALUES") {
-    $columns = $matches[1] -split ',' | ForEach-Object { $_.Trim() }
-} else {
-    Write-Host "Failed to parse column names." -ForegroundColor Red
-    exit
-}
+$Columns = ($firstInsert -replace '^.+?\(|\)\s*VALUES.+$','') -split '\s*,\s*'
 
 # =====================================================
-# Column Definitions (unchanged)
+# ================= Duplicate Tracking ===============
 # =====================================================
-$colDefs = @()
-foreach ($col in $columns) {
-    switch ($col) {
-        "NUM" { $colDefs += "$col INT NOT NULL" }
-        "CHECKED" { $colDefs += "$col BOOLEAN" }
-        "COLORTAG" { $colDefs += "$col INT" }
-        "YEAR" { $colDefs += "$col INT" }
-        "LENGTH" { $colDefs += "$col INT" }
-        "DISKS" { $colDefs += "$col INT" }
-        "NBEXTRAS" { $colDefs += "$col INT" }
-        Default { $colDefs += "$col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+$seenHashes = [System.Collections.Generic.HashSet[string]]::new()
+
+# =====================================================
+# ================= Database Setup ===================
+# =====================================================
+if (-not $Config.DryRun) {
+
+    & $Config.MySqlExe -u $Config.MySqlUser `
+        -e "CREATE DATABASE IF NOT EXISTS $($Config.MySqlDB) CHARACTER SET utf8mb4;"
+
+    if ($Config.DropTable) {
+        & $Config.MySqlExe -u $Config.MySqlUser $Config.MySqlDB `
+            -e "DROP TABLE IF EXISTS movies;"
     }
-}
 
-$createTableSQL = @"
-CREATE TABLE IF NOT EXISTS movies (
-    $($colDefs -join ",`n")
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"@
-
-if (-not $DryRun) {
-    & $MySqlExe -h $MySqlHost -u $MySqlUser `
-        --default-character-set=utf8mb4 $MySqlDB `
-        --execute $createTableSQL
-}
-
-# =====================================================
-# Hash Sets
-# =====================================================
-$existingHashes = New-Object System.Collections.Generic.HashSet[string]
-$seenHashes     = New-Object System.Collections.Generic.HashSet[string]
-
-# =====================================================
-# Logs & Stats
-# =====================================================
-"==== Import started $(Get-Date) ====" | Out-File $LogFile -Encoding UTF8
-"==== Duplicate detection log $(Get-Date) ====" | Out-File $DuplicateFile -Encoding UTF8
-
-$totalFiles      = $sqlFiles.Count
-$currentFile     = 0
-$totalRecords    = 0
-$duplicates      = 0
-$totalBytes      = ($sqlFiles | Measure-Object Length -Sum).Sum
-$processedBytes  = 0
-$globalStart     = Get-Date
-
-# =====================================================
-# Import Loop (LATIN1 → UTF-8)
-# =====================================================
-foreach ($file in $sqlFiles) {
-
-    $currentFile++
-    $fileStart = Get-Date
-
-    Write-Host ""
-    Write-Host "[$currentFile/$totalFiles] Processing $($file.Name)"
-
-    $tempSql = [System.IO.Path]::GetTempFileName()
-    $writer  = [System.IO.StreamWriter]::new($tempSql, $false, $Utf8NoBom)
-    $writer.WriteLine("START TRANSACTION;")
-
-    $fs     = [System.IO.File]::OpenRead($file.FullName)
-    $reader = New-Object System.IO.StreamReader($fs, $Latin1Encoding)
-
-    $lineNumber = 0
-    while (-not $reader.EndOfStream) {
-        $lineNumber++
-        $rawLine = $reader.ReadLine()
-        $line = NormalizeLine($rawLine)
-
-        if ($line -match "^INSERT INTO movies") {
-            $record = Get-RecordHash $line
-            if ($record -and ($existingHashes.Contains($record.Hash) -or $seenHashes.Contains($record.Hash))) {
-                $duplicates++
-                "File:$($file.Name) Line:$lineNumber Hash:$($record.Hash)" |
-                    Out-File $DuplicateFile -Append -Encoding UTF8
-                continue
-            }
-
-            $seenHashes.Add($record.Hash) | Out-Null
-
-            if ($UpsertDuplicates) {
-                $line = $line -replace '^INSERT INTO movies', 'REPLACE INTO movies'
-            } else {
-                $line = $line -replace '^INSERT INTO movies', 'INSERT IGNORE INTO movies'
-            }
-
-            $line = EscapeInsertLine $line
-            $writer.WriteLine($line)
-            $totalRecords++
+    $defs = @()
+    foreach ($c in $Columns) {
+        if ($c -eq "NUM") {
+            $defs += "$c INT NOT NULL PRIMARY KEY"
         } else {
-            $writer.WriteLine($line)
+            $defs += "$c TEXT CHARACTER SET utf8mb4"
         }
-
-        $processedBytes += $Latin1Encoding.GetByteCount($rawLine + "`n")
-
-        Write-Progress -Id 1 -Activity "Overall Import" `
-            -PercentComplete ([Math]::Min(100, ($processedBytes / $totalBytes) * 100))
     }
+    $defs += "RECORDHASH CHAR(64) NOT NULL UNIQUE"
 
-    $writer.WriteLine("COMMIT;")
-    $reader.Close()
-    $fs.Close()
-    $writer.Close()
-
-    if (-not $DryRun) {
-        & cmd /c "$MySqlExe --default-character-set=utf8mb4 -h $MySqlHost -u $MySqlUser $MySqlDB < `"$tempSql`""
-    }
-
-    Remove-Item $tempSql -Force -ErrorAction SilentlyContinue
+    & $Config.MySqlExe -u $Config.MySqlUser $Config.MySqlDB `
+        -e "CREATE TABLE IF NOT EXISTS movies ($($defs -join ',')) ENGINE=InnoDB;"
 }
 
 # =====================================================
-# Completion
+# ================= MySQL Connection =================
 # =====================================================
-Write-Progress -Id 1 -Completed
+if (-not $Config.DryRun) {
+    Add-Type -Path "C:\Program Files (x86)\MySQL\MySQL Connector NET 9.5\MySql.Data.dll"
+    $conn = New-Object MySql.Data.MySqlClient.MySqlConnection(
+        "server=$($Config.MySqlHost);uid=$($Config.MySqlUser);database=$($Config.MySqlDB);charset=utf8mb4;"
+    )
+    $conn.Open()
+    $tx = $conn.BeginTransaction()
+}
 
+# =====================================================
+# ================= Batch Insert =====================
+# =====================================================
+function InsertBatch($rows) {
+    if (-not $rows -or $Config.DryRun) { return }
+
+    $cols = $Columns + "RECORDHASH"
+    $cmd  = $conn.CreateCommand()
+    $cmd.Transaction = $tx
+
+    $valuesList = @()
+
+    for ($i=0; $i -lt $rows.Count; $i++) {
+        $paramNames = @()
+        foreach ($c in $cols) {
+            $paramName = "@${c}_$i"
+            $paramNames += $paramName
+            $value = $rows[$i][$c]
+            if ($null -eq $value) { $value = [DBNull]::Value }
+            $cmd.Parameters.AddWithValue($paramName, $value) | Out-Null
+        }
+        $valuesList += "(" + ($paramNames -join ',') + ")"
+    }
+
+    $columnList = ($cols -join ',')
+    $cmd.CommandText = "INSERT INTO movies ($columnList) VALUES " + ($valuesList -join ',')
+
+    $global:committedRecords += $cmd.ExecuteNonQuery()
+}
+
+# =====================================================
+# ================= Import Loop ======================
+# =====================================================
+$totalRecords = 0
+$duplicates   = 0
+$currentFile  = 0
+$globalStart  = Get-Date
+$totalFiles   = $sqlFiles.Count
+
+foreach ($file in $sqlFiles) {
+    $currentFile++
+    $reader = [IO.StreamReader]::new($file.FullName,$Config.InputEncoding)
+    $batch  = @()
+    $lineNo = 0
+
+    # Count total lines for per-file progress
+    $totalLines = (Get-Content $file.FullName -Encoding $Config.InputEncoding).Count
+
+    while (-not $reader.EndOfStream) {
+        $lineNo++
+        $row = ParseInsertLine (NormalizeLine $reader.ReadLine()) $Columns
+        if (-not $row) { continue }
+
+        $totalRecords++
+        $hash = Get-RecordHash $row
+
+        if ($seenHashes.Contains($hash)) {
+            $duplicates++
+            "File:$($file.Name) Line:$lineNo Hash:$hash" |
+                Out-File $Config.DuplicateFile -Append
+            continue
+        }
+
+        $seenHashes.Add($hash) | Out-Null
+        $row.RECORDHASH = $hash
+        $batch += $row
+
+        if ($batch.Count -ge $Config.BatchSize) {
+            InsertBatch $batch
+            $batch = @()
+        }
+
+        # Per-file progress
+        $percentFile = [math]::Round(($lineNo / $totalLines) * 100, 0)
+        Write-Progress -Activity "Processing file $($file.Name)" `
+                       -Status "$lineNo / $totalLines lines" `
+                       -PercentComplete $percentFile `
+                       -Id 1
+    }
+
+    InsertBatch $batch
+    $reader.Close()
+
+    # Overall progress
+    $percentTotal = [math]::Round(($currentFile / $totalFiles) * 100, 0)
+    Write-Progress -Activity "Overall Progress" `
+                   -Status "File $currentFile / $totalFiles processed" `
+                   -PercentComplete $percentTotal `
+                   -Id 0
+}
+
+if (-not $Config.DryRun) {
+    $tx.Commit()
+    $conn.Close()
+}
+
+# =====================================================
+# ================= Summary ==========================
+# =====================================================
 $elapsed = Get-ElapsedSeconds $globalStart
 
 $summary = @"
-==== Import completed $(Get-Date) ====
-Files processed : $currentFile
-Total records   : $totalRecords
-Duplicates      : $duplicates
-Time taken      : {0:N2} sec
-Dry-run mode    : $DryRun
-UPSERT enabled  : $UpsertDuplicates
-Input charset   : latin1 (ISO-8859-1)
-Output charset  : utf8mb4
-====================================
+============== Import completed $(Get-Date) ==============
+Files processed          : $currentFile
+Total records parsed     : $totalRecords
+Records committed        : $committedRecords
+Duplicates logged        : $duplicates
+Hash fields              : FORMATTEDTITLE | YEAR | DIRECTOR | URL | FILEPATH
+Time taken               : {0:N2} sec
+Dry-run mode             : $($Config.DryRun)
+Drop table before import : $($Config.DropTable)
+Input charset            : latin1 (ISO-8859-1)
+Output charset           : utf8mb4
+SQL file filter          : $($Config.SqlFileFilter)
+Excluded files           : $($Config.ExcludeFiles -join ', ')
+=========================================================
 "@ -f $elapsed
 
-$summary | Out-File $LogFile -Append -Encoding UTF8
+$summary | Out-File $Config.LogFile -Append -Encoding UTF8
 Write-Host $summary -ForegroundColor Green
