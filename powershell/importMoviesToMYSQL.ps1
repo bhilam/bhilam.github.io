@@ -10,13 +10,12 @@ param(
     [string]$MySqlPass      = "",
     [string]$MySqlDB        = "movies",
     [string]$TableName      = "movies",
-    [string]$LogFile        = "import_log.txt",
-    [string]$DuplicateFile  = "duplicates_log.txt",
     [bool]$DryRun           = $false,
     [bool]$DropTable        = $true,
     [string]$SqlFileFilter  = "movies_*_*-*.sql",
     [string[]]$ExcludeFiles = @('movies_00_0000.sql'),
-    [int]$BatchSize         = 500
+    [int]$BatchSize         = 500,
+    [string[]]$HashFields   = @("FORMATTEDTITLE","YEAR","DIRECTOR","URL")  # fields used for duplicate hash
 )
 
 # =====================================================
@@ -34,8 +33,6 @@ $Config = @{
     MySqlPass      = $MySqlPass
     MySqlDB        = $MySqlDB
     TableName      = $TableName
-    LogFile        = Join-Path $SourceFolder $LogFile
-    DuplicateFile  = Join-Path $SourceFolder $DuplicateFile
     DryRun         = $DryRun
     DropTable      = $DropTable
     InputEncoding  = $InputEncoding
@@ -43,6 +40,7 @@ $Config = @{
     SqlFileFilter  = $SqlFileFilter
     ExcludeFiles   = $ExcludeFiles
     BatchSize      = $BatchSize
+    HashFields     = $HashFields
 }
 
 # =====================================================
@@ -57,6 +55,32 @@ chcp 65001 | Out-Null
 $OutputEncoding = $Config.OutputEncoding
 
 # =====================================================
+# =============== Log File Setup =====================
+# =====================================================
+function Get-TimestampedFile($baseName, $folder, $ext) {
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $counter = 0
+    do {
+        $fileName = "$baseName`_$timestamp"
+        if ($counter -gt 0) { $fileName += "_$counter" }
+        $fileName += $ext
+        $fullPath = Join-Path $folder $fileName
+        $counter++
+    } while (Test-Path $fullPath)
+    return $fullPath
+}
+
+$Config.LogFile       = Get-TimestampedFile "import_log" $Config.SourceFolder ".txt"
+$Config.DuplicateFile = Get-TimestampedFile "duplicates_log" $Config.SourceFolder ".txt"
+
+# Function to keep only last N versions
+function Cleanup-OldFiles($folder, $baseName, $ext, $keep = 3) {
+    $files = Get-ChildItem $folder -Filter "$baseName*$ext" | Sort-Object LastWriteTime -Descending
+    if ($files.Count -le $keep) { return }
+    $files[$keep..($files.Count-1)] | Remove-Item -Force
+}
+
+# =====================================================
 # ================= Helper Functions =================
 # =====================================================
 function NormalizeLine($line) {
@@ -67,12 +91,9 @@ function Get-ElapsedSeconds($start) {
     ((Get-Date) - $start).TotalSeconds
 }
 
-function Get-RecordHash($v) {
-    $s = "$($v.FORMATTEDTITLE)|$($v.YEAR)|$($v.DIRECTOR)|$($v.URL)|$($v.FILEPATH)"
-    $sha = [Security.Cryptography.SHA256]::Create()
-    ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s)))) -replace '-', ''
-}
-
+# =====================================================
+# ================= Parse SQL Line ===================
+# =====================================================
 function ParseInsertLine {
     param ($line, $Columns)
 
@@ -201,17 +222,34 @@ if (-not $Config.DryRun) {
 # ================= Duplicate Detection ==============
 # =====================================================
 $existingHashes = @{}
+$existingRecords = @{}
 $checkCmd = $conn.CreateCommand()
-$checkCmd.CommandText = "SELECT RECORDHASH FROM $($Config.TableName);"
+$checkCmd.CommandText = "SELECT * FROM $($Config.TableName);"
 $reader = $checkCmd.ExecuteReader()
-while ($reader.Read()) { $existingHashes[$reader["RECORDHASH"]] = $true }
+while ($reader.Read()) {
+    $hash = $reader["RECORDHASH"].ToString().ToLower()
+    $existingHashes[$hash] = $true
+    $existingRecords[$hash] = @{}
+    foreach ($f in $Config.HashFields) { $existingRecords[$hash][$f] = $reader[$f] }
+}
 $reader.Close()
+
+function Get-RecordHash($v) {
+    $s = @()
+    foreach ($f in $Config.HashFields) {
+        if ($v[$f] -ne $null) { $s += $v[$f].Trim().ToLower() } else { $s += "" }
+    }
+    $str = $s -join '|'
+    $sha = [Security.Cryptography.SHA256]::Create()
+    ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($str)))).Replace('-','').ToLower()
+}
 
 # =====================================================
 # ================= Batch Insert =====================
 # =====================================================
 function InsertBatch($rows) {
     if (-not $rows -or $Config.DryRun) { return }
+
     $cols = $Columns + "RECORDHASH"
     $cmd = $conn.CreateCommand()
     $cmd.Transaction = $tx
@@ -248,11 +286,14 @@ foreach ($file in $sqlFiles) {
     $reader = [IO.StreamReader]::new($file.FullName,$Config.InputEncoding)
     $batch  = @()
     $lineNo = 0
-    $totalLines = (Get-Content $file.FullName -Encoding $Config.InputEncoding).Count
+    $fileSize = (Get-Item $file.FullName).Length
+    $bytesRead = 0
 
     while (-not $reader.EndOfStream) {
+        $line = $reader.ReadLine()
         $lineNo++
-        $row = ParseInsertLine (NormalizeLine $reader.ReadLine()) $Columns
+        $bytesRead += ($Config.InputEncoding.GetByteCount($line) + 2) # approx newline
+        $row = ParseInsertLine (NormalizeLine $line) $Columns
         if (-not $row) { continue }
 
         $hash = Get-RecordHash $row
@@ -260,18 +301,29 @@ foreach ($file in $sqlFiles) {
 
         if ($existingHashes.ContainsKey($hash)) {
             $duplicates++
-            "File:$($file.Name) Line:$lineNo Hash:$hash" | Out-File $Config.DuplicateFile -Append -Encoding $Config.OutputEncoding
+            $existing = $existingRecords[$hash]
+            $diffs = @()
+            foreach ($f in $Config.HashFields) {
+                if (($row[$f] -ne $null) -and ($row[$f] -ne $existing[$f])) {
+                    $diffs += "${f}:'$($row[$f])'->'$($existing[$f])'"
+                }
+            }
+            $diffStr = if ($diffs.Count -gt 0) { " | Diff: " + ($diffs -join ', ') } else { "" }
+            $dupLine = "DUPLICATE -> File:$($file.Name) Line:$lineNo NUM:$($row.NUM) Title:'$($row.FORMATTEDTITLE)' Year:$($row.YEAR)$diffStr Hash:$hash"
+            $dupLine | Out-File $Config.DuplicateFile -Append -Encoding $Config.OutputEncoding
             continue
         }
 
         $row.RECORDHASH = $hash
         $existingHashes[$hash] = $true
-        $batch += $row
+        $existingRecords[$hash] = @{}
+        foreach ($f in $Config.HashFields) { $existingRecords[$hash][$f] = $row[$f] }
 
+        $batch += $row
         if ($batch.Count -ge $Config.BatchSize) { InsertBatch $batch; $batch=@() }
 
-        $percentFile = [math]::Round(($lineNo/$totalLines)*100,0)
-        Write-Progress -Activity "Processing file $($file.Name)" -Status "$lineNo / $totalLines lines" -PercentComplete $percentFile -Id 1
+        $percentFile = [math]::Round(($bytesRead/$fileSize)*100,0)
+        Write-Progress -Activity "Processing file $($file.Name)" -Status "$lineNo lines processed" -PercentComplete $percentFile -Id 1
     }
 
     InsertBatch $batch
@@ -295,7 +347,7 @@ Total records parsed     : $totalRecords
 Records committed        : $global:committedRecords
 Duplicates logged        : $duplicates
 Duplicate log file       : $($Config.DuplicateFile)
-Hash fields              : FORMATTEDTITLE | YEAR | DIRECTOR | URL | FILEPATH
+Hash fields              : $($Config.HashFields -join ' | ')
 Time taken               : {0:N2} sec
 Dry-run mode             : $($Config.DryRun)
 Drop table before import : $($Config.DropTable)
@@ -309,3 +361,9 @@ Database table           : $($Config.TableName)
 
 $summary | Out-File $Config.LogFile -Append -Encoding $Config.OutputEncoding
 Write-Host $summary -ForegroundColor Green
+
+# =====================================================
+# =============== Cleanup Old Logs ===================
+# =====================================================
+Cleanup-OldFiles $Config.SourceFolder "import_log" ".txt" 3
+Cleanup-OldFiles $Config.SourceFolder "duplicates_log" ".txt" 3
