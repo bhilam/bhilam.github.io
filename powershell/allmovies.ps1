@@ -3,19 +3,20 @@
 # =====================================================
 
 param(
-    [string]$SourceFolder   = "C:\wamp64-3.3.7\www\movies\antexport - copy",
-    [string]$MySqlExe       = "C:\wamp64-3.3.7\bin\mysql\mysql9.1.0\bin\mysql.exe",
-    [string]$MySqlHost      = "localhost",
-    [string]$MySqlUser      = "root",
-    [string]$MySqlPass      = "",
-    [string]$MySqlDB        = "movies",
-    [string]$TableName      = "movies",
-    [bool]$DryRun           = $false,
-    [bool]$DropTable        = $true,
-    [string]$SqlFileFilter  = "movies_*_*-*.sql",
-    [string[]]$ExcludeFiles = @('movies_00_0000.sql'),
-    [int]$BatchSize         = 500,
-    [string[]]$HashFields   = @("FORMATTEDTITLE","YEAR","DIRECTOR","URL")  # fields used for duplicate hash
+    [string]$SourceFolder			= "C:\wamp64-3.3.7\www\movies\antexport - copy",
+    [string]$MySqlExe				= "C:\wamp64-3.3.7\bin\mysql\mysql9.1.0\bin\mysql.exe",
+    [string]$MySqlHost				= "localhost",
+    [string]$MySqlUser				= "root",
+    [string]$MySqlPass				= "",
+    [string]$MySqlDB				= "movies",
+    [string]$TableName				= "movies",
+    [bool]$DryRun					= $false,
+    [bool]$DropTable				= $true,
+	[bool]$AllowDuplicateHash_Num	= $true,
+    [string]$SqlFileFilter			= "movies_*_*-*.sql",
+    [string[]]$ExcludeFiles			= @('movies_00_0000.sql'),
+    [int]$BatchSize					= 500,
+    [string[]]$HashFields			= @("FORMATTEDTITLE","YEAR","DIRECTOR","URL")  # fields used for duplicate hash
 )
 
 # =====================================================
@@ -26,21 +27,22 @@ $InputEncoding  = [Text.Encoding]::GetEncoding("ISO-8859-1")
 $OutputEncoding = [Text.Encoding]::UTF8
 
 $Config = @{
-    SourceFolder   = $SourceFolder
-    MySqlExe       = $MySqlExe
-    MySqlHost      = $MySqlHost
-    MySqlUser      = $MySqlUser
-    MySqlPass      = $MySqlPass
-    MySqlDB        = $MySqlDB
-    TableName      = $TableName
-    DryRun         = $DryRun
-    DropTable      = $DropTable
-    InputEncoding  = $InputEncoding
-    OutputEncoding = $OutputEncoding
-    SqlFileFilter  = $SqlFileFilter
-    ExcludeFiles   = $ExcludeFiles
-    BatchSize      = $BatchSize
-    HashFields     = $HashFields
+    SourceFolder			= $SourceFolder
+    MySqlExe				= $MySqlExe
+    MySqlHost				= $MySqlHost
+    MySqlUser				= $MySqlUser
+    MySqlPass				= $MySqlPass
+    MySqlDB					= $MySqlDB
+    TableName				= $TableName
+    DryRun					= $DryRun
+    DropTable				= $DropTable
+	AllowDuplicateHash_Num	= $AllowDuplicateHash_Num
+    InputEncoding			= $InputEncoding
+    OutputEncoding			= $OutputEncoding
+    SqlFileFilter			= $SqlFileFilter
+    ExcludeFiles			= $ExcludeFiles
+    BatchSize				= $BatchSize
+    HashFields				= $HashFields
 }
 
 # =====================================================
@@ -111,10 +113,9 @@ function ParseInsertLine {
         $v = $vals[$i].Trim()
         if ($v -eq "NULL") { $v = $null }
         elseif ($v.StartsWith("'")) {
-            #$v = $v.Substring(1,$v.Length-2).Replace("''","'")
 			$v = $v.Substring(1,$v.Length-2)
 			$v = $v.Replace("''","'")
-			$v = $v.Replace("\\","\")   # <-- ADD THIS LINE
+			$v = $v.Replace("\\","\")
         }
         $row[$Columns[$i]] = $v
     }
@@ -214,7 +215,14 @@ if (-not $Config.DryRun) {
     foreach ($c in $Columns) {
         if ($c -eq "NUM") { $defs += "$c INT NOT NULL PRIMARY KEY" } else { $defs += "$c TEXT CHARACTER SET utf8mb4" }
     }
-    $defs += "RECORDHASH CHAR(64) NOT NULL UNIQUE"
+	
+	if ($Config.AllowDuplicateHash_Num) {
+		# Allow unique records to be inserted
+		$defs += "RECORDHASH CHAR(64) NOT NULL"
+	} else {
+		# Disallow unique records to be inserted
+		$defs += "RECORDHASH CHAR(64) NOT NULL UNIQUE"
+	}
 
     $createCmd = $conn.CreateCommand()
     $createCmd.CommandText = "CREATE TABLE IF NOT EXISTS $($Config.TableName) ($($defs -join ',')) ENGINE=InnoDB;"
@@ -224,9 +232,40 @@ if (-not $Config.DryRun) {
     $indexCmd.ExecuteNonQuery() | Out-Null
 }
 
-# =====================================================
-# ================= Duplicate Detection ==============
-# =====================================================
+# ===============================================================================
+# ================= Duplicate Detection - Allow Insert and logging ==============
+# ===============================================================================
+# Detection and logging of duplicates
+function Process-Duplicate($row, $hash, $file, $lineNo) {
+    $global:duplicates++
+    $existing = $existingRecords[$hash]
+    $diffs = @()
+    foreach ($f in $Config.HashFields) {
+        if (($row[$f] -ne $null) -and ($row[$f] -ne $existing[$f])) {
+            $diffs += "${f}:'$($row[$f])'->'$($existing[$f])'"
+        }
+    }
+    $diffStr = if ($diffs.Count -gt 0) { " | Diff: " + ($diffs -join ', ') } else { "" }
+    $dupLine = "DUPLICATE -> File:$($file.Name) Line:$lineNo NUM:$($row.NUM) Title:'$($row.FORMATTEDTITLE)' Year:$($row.YEAR)$diffStr Hash:$hash"
+    
+    # Log duplicate record details
+    $dupLine | Out-File $Config.DuplicateFile -Append -Encoding $Config.OutputEncoding
+    
+	
+	# Insert the duplicate record based on the config value: AllowDuplicateHash_Num
+	if ($Config.AllowDuplicateHash_Num) {
+		$row.RECORDHASH = $hash
+		$existingHashes[$hash] = $true
+		$existingRecords[$hash] = @{}
+		foreach ($f in $Config.HashFields) { $existingRecords[$hash][$f] = $row[$f] }
+
+		InsertBatch @($row)  # Insert duplicate record
+	}
+}
+
+# ========================================================================================
+# ================= Duplicate Detection - Disallow Insert but allow logging ==============
+# ========================================================================================
 $existingHashes = @{}
 $existingRecords = @{}
 $checkCmd = $conn.CreateCommand()
@@ -282,7 +321,7 @@ function InsertBatch($rows) {
 # ================= Import Loop ======================
 # =====================================================
 $totalRecords = 0
-$duplicates   = 0
+$global:duplicates   = 0
 $currentFile  = 0
 $globalStart  = Get-Date
 $global:committedRecords = 0
@@ -305,20 +344,11 @@ foreach ($file in $sqlFiles) {
         $hash = Get-RecordHash $row
         $totalRecords++
 
-        if ($existingHashes.ContainsKey($hash)) {
-            $duplicates++
-            $existing = $existingRecords[$hash]
-            $diffs = @()
-            foreach ($f in $Config.HashFields) {
-                if (($row[$f] -ne $null) -and ($row[$f] -ne $existing[$f])) {
-                    $diffs += "${f}:'$($row[$f])'->'$($existing[$f])'"
-                }
-            }
-            $diffStr = if ($diffs.Count -gt 0) { " | Diff: " + ($diffs -join ', ') } else { "" }
-            $dupLine = "DUPLICATE -> File:$($file.Name) Line:$lineNo NUM:$($row.NUM) Title:'$($row.FORMATTEDTITLE)' Year:$($row.YEAR)$diffStr Hash:$hash"
-            $dupLine | Out-File $Config.DuplicateFile -Append -Encoding $Config.OutputEncoding
-            continue
-        }
+		# Handle duplicate records
+		if ($existingHashes.ContainsKey($hash)) {
+			Process-Duplicate $row $hash $file $lineNo
+			continue
+		}
 
         $row.RECORDHASH = $hash
         $existingHashes[$hash] = $true
