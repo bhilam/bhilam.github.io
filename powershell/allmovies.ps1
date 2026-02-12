@@ -106,7 +106,7 @@ function ParseInsertLine {
 
     if ($vals.Count -ne $Columns.Count) { return $null }
 
-    $row = @{}
+    $row = @{ }
     for ($i=0; $i -lt $Columns.Count; $i++) {
         $v = $vals[$i].Trim()
         if ($v -eq "NULL") { $v = $null }
@@ -219,6 +219,9 @@ if (-not $Config.DryRun) {
     $createCmd = $conn.CreateCommand()
     $createCmd.CommandText = "CREATE TABLE IF NOT EXISTS $($Config.TableName) ($($defs -join ',')) ENGINE=InnoDB;"
     $createCmd.ExecuteNonQuery() | Out-Null
+    $indexCmd = $conn.CreateCommand()
+    $indexCmd.CommandText = "CREATE INDEX idx_recordhash_num ON $($Config.TableName) (RECORDHASH, NUM);"
+    $indexCmd.ExecuteNonQuery() | Out-Null
 }
 
 # =====================================================
@@ -232,7 +235,7 @@ $reader = $checkCmd.ExecuteReader()
 while ($reader.Read()) {
     $hash = $reader["RECORDHASH"].ToString().ToLower()
     $existingHashes[$hash] = $true
-    $existingRecords[$hash] = @{}
+    $existingRecords[$hash] = @{ }
     foreach ($f in $Config.HashFields) { $existingRecords[$hash][$f] = $reader[$f] }
 }
 $reader.Close()
@@ -319,7 +322,7 @@ foreach ($file in $sqlFiles) {
 
         $row.RECORDHASH = $hash
         $existingHashes[$hash] = $true
-        $existingRecords[$hash] = @{}
+        $existingRecords[$hash] = @{ }
         foreach ($f in $Config.HashFields) { $existingRecords[$hash][$f] = $row[$f] }
 
         $batch += $row
@@ -344,7 +347,7 @@ if (-not $Config.DryRun) { $tx.Commit(); $conn.Close() }
 $elapsed = Get-ElapsedSeconds $globalStart
 
 $summary = @"
-============== Import completed $(Get-Date) ==============
+============== allmovies.ps1: Import completed $(Get-Date) ==============
 Files processed          : $currentFile
 Total records parsed     : $totalRecords
 Records committed        : $global:committedRecords
